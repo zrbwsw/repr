@@ -469,9 +469,7 @@ class SimpleMLPAdaLN(nn.Module):
 
 
 class REPR(nn.Module):
-    """
-    Just image Transformer.
-    """
+    """Joint masked image modeling and representation learning."""
     def __init__(
         self,
         input_size=256,
@@ -488,22 +486,20 @@ class REPR(nn.Module):
         batch_repeat=1,
         batch_repeat_mar=1,
         diff_repeat=4,
-        d_num_p=8,
+        b_num_p=8,
         diff_repeat_repr=32,
-        d_max=48,
+        b_max=48,
         mask_m=256 - 76,
         mask_strategy_mar='block',
         mask_strategy_repr='block',
         repr_loss_weight=0.1,
         repr_delta=0.2,
         pad_dropout=0.05,
-        repr_noise_bins=8,
         mu_repr=-1.2,
         std_repr=1.2,
         mu_mar=-1.2,
         std_mar=1.2,
         is_first_iter=True,
-        is_repr_encoderdecoder=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -525,7 +521,6 @@ class REPR(nn.Module):
         self.repr_delta = repr_delta
         self.pad_dropout = pad_dropout
         self.is_first_iter = is_first_iter
-        self.is_repr_encoderdecoder = is_repr_encoderdecoder
         self.mu_repr, self.std_repr, self.mu_mar, self.std_mar = mu_repr, std_repr, mu_mar, std_mar
 
         # linear embed
@@ -557,11 +552,10 @@ class REPR(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
         torch.nn.init.normal_(self.mask_token, std=.02)
 
-        self.d_num_p = d_num_p
-        self.d_max = d_max
+        self.b_num_p = b_num_p
+        self.b_max = b_max
         self.hw_len = input_size // patch_size
-        self.repr_noise_bins = repr_noise_bins
-        self.diff_bin_repeat_repr = diff_repeat_repr // repr_noise_bins
+        self.diff_repeat_repr = diff_repeat_repr
 
         self.factor_pad = 1
         self.pad_hw = self.hw_len + 2*self.factor_pad
@@ -582,16 +576,14 @@ class REPR(nn.Module):
             for _ in range(3)
         ])
 
-        self.register_buffer('noise_bin_limits', torch.linspace(0,1,self.repr_noise_bins+1))
 
-        self.is_d_embed = nn.Parameter(torch.zeros(1, hidden_size), requires_grad=True)
-        torch.nn.init.normal_(self.is_d_embed, std=.02)
+        self.is_b_embed = nn.Parameter(torch.zeros(1, hidden_size), requires_grad=True)
+        torch.nn.init.normal_(self.is_b_embed, std=.02)
 
-        if self.is_repr_encoderdecoder:
-            self.repr_encoder = nn.ModuleList([
-                MAGEBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
-                for i in range(3)
-            ])
+        self.repr_encoder = nn.ModuleList([
+            MAGEBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
+            for i in range(3)
+        ])
 
         if self.is_first_iter:
             self.diff_mlp = SimpleMLPAdaLN(self.patch_dim, hidden_size, self.patch_dim, hidden_size, diff_mlp_depth)
@@ -600,6 +592,13 @@ class REPR(nn.Module):
             self.diff_mlp = SimpleMLPAdaLN(self.repr_dim, hidden_size, self.repr_dim, hidden_size, diff_mlp_depth)
 
         self.initialize_weights()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        old_key = prefix + "is_d_embed"
+        if old_key in state_dict:
+            state_dict.setdefault(prefix + "is_b_embed", state_dict.pop(old_key))
+        state_dict.pop(prefix + "noise_bin_limits", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -689,11 +688,11 @@ class REPR(nn.Module):
 
         return counts[torch.randperm(B, device=device)]
 
-    def sample_m_reprv2_1_random(self, B_IN, N, device, H=16, W=16, R=1):
+    def sample_mask_random(self, B_IN, N, device, H=16, W=16, R=1):
         assert H * W == N
 
-        P = self.d_num_p
-        d_max = min(self.d_max, N)
+        P = self.b_num_p
+        b_max = min(self.b_max, N)
 
         def random_mask(B, min_masked):
             counts = self._balanced_mask_counts(B, N, min_masked, device)
@@ -701,38 +700,38 @@ class REPR(nn.Module):
             return rank < counts[:, None]
 
         is_mask_A = random_mask(R * B_IN, self.mask_m)
-        is_mask_D = random_mask(B_IN, N - d_max)
+        is_mask_B = random_mask(B_IN, N - b_max)
 
         is_valid_A = rearrange(is_mask_A, '(R B) N -> R B N', R=R).all(dim=0)
-        is_valid_dp = is_valid_A & is_mask_D
-        is_dp_idx = (torch.rand(B_IN, N, device=device) + is_valid_dp.float()).argsort(dim=1, descending=True)[:, :P]
-        is_dp = torch.zeros(P * B_IN, N, device=device, dtype=bool).scatter(1, rearrange(is_dp_idx, 'B P -> (P B) 1'), True)
-        is_dp = rearrange(is_dp, '(P B) N -> P B N', P=P)
+        is_valid_bp = is_valid_A & is_mask_B
+        is_bp_idx = (torch.rand(B_IN, N, device=device) + is_valid_bp.float()).argsort(dim=1, descending=True)[:, :P]
+        is_bp = torch.zeros(P * B_IN, N, device=device, dtype=bool).scatter(1, rearrange(is_bp_idx, 'B P -> (P B) 1'), True)
+        is_bp = rearrange(is_bp, '(P B) N -> P B N', P=P)
 
-        is_mask_Dp = repeat(is_mask_D, 'B N -> P B N', P=P) & (~is_dp)
+        is_mask_Bp = repeat(is_mask_B, 'B N -> P B N', P=P) & (~is_bp)
 
         def get_selected(mask, num_selected):
             rank = torch.rand_like(mask.float()).masked_fill(~mask, -1).argsort(dim=1)
             return torch.zeros_like(mask).scatter(1, rank[:, :num_selected], True)
 
-        num_selected_addp = max(N - self.mask_m, self.d_max + 1)
-        is_selected_A = get_selected(is_mask_A, num_selected_addp)
-        is_selected_D = get_selected(is_mask_D, num_selected_addp)
-        is_selected_Dp = get_selected(rearrange(is_mask_Dp, 'P B N -> (P B) N'), num_selected_addp)
-        is_mask_AD = is_mask_A & repeat(is_mask_D, 'B N -> (R B) N', R=R)
-        is_selected_AD = get_selected(is_mask_AD, N - self.mask_m + self.d_max)
-        is_valid_target = torch.cat([is_mask_D, is_mask_A], dim=0)
+        num_selected_ab = max(N - self.mask_m, self.b_max + 1)
+        is_selected_A = get_selected(is_mask_A, num_selected_ab)
+        is_selected_B = get_selected(is_mask_B, num_selected_ab)
+        is_selected_Bp = get_selected(rearrange(is_mask_Bp, 'P B N -> (P B) N'), num_selected_ab)
+        is_mask_AB = is_mask_A & repeat(is_mask_B, 'B N -> (R B) N', R=R)
+        is_selected_AB = get_selected(is_mask_AB, N - self.mask_m + self.b_max)
+        is_valid_target = torch.cat([is_mask_B, is_mask_A], dim=0)
 
-        return is_selected_A, is_mask_A, is_selected_D, is_mask_D, is_selected_Dp, rearrange(is_mask_Dp, 'P B N -> (P B) N'), is_selected_AD, is_mask_AD, is_dp, is_valid_target
+        return is_selected_A, is_mask_A, is_selected_B, is_mask_B, is_selected_Bp, rearrange(is_mask_Bp, 'P B N -> (P B) N'), is_selected_AB, is_mask_AB, is_bp, is_valid_target
 
-    def sample_m_reprv2_1_block(self, B_IN, N, device, H=16, W=16, R=1):
+    def sample_mask_block(self, B_IN, N, device, H=16, W=16, R=1):
         # Guarantees 
         # m_index 1 has min_mask_ratio selected
-        # m_index 2 ~ U[min_mask_ratio,1] per batch index masked. 
+        # m_index 2 is uniform over [min_mask_ratio, 1] per batch index.
         #   Global sum equal for compile
-        # is_mask_background_2: background without D, shape b,n
-        # is_mask_background_2_dp: background without DP, exactly 1 fewer true per element, shape d,b,n
-        # is_mask_background_1_dp: background without DP MAE encoder mask  TODO clever 2x speedup.
+        # is_mask_background_2: background without B, shape b,n
+        # is_mask_background_2_bp: background without BP, exactly 1 fewer true per element, shape d,b,n
+        # is_mask_background_1_bp: background without BP MAE encoder mask  TODO clever 2x speedup.
         
         def block_mask(B, N, M, block=4):
             # Slop code that works
@@ -770,7 +769,7 @@ class REPR(nn.Module):
 
             return rank < counts[:, None]
 
-        P = self.d_num_p
+        P = self.b_num_p
 
         is_mask_encoder = block_mask(R*B_IN,N,self.mask_m)
 
@@ -778,22 +777,22 @@ class REPR(nn.Module):
         is_valid_target = is_valid_mask.clone()
         is_valid_target = rearrange(is_valid_target, 'RB H W -> RB (H W)')
 
-        is_dp_idx = (repeat(~is_valid_target, '(R B) N -> R B N', R=R).sum(dim=0) + torch.rand((B_IN,N), device=device) * 0.5).argsort(dim=1)[:,:P]
-        is_dp = torch.zeros(P*B_IN, N, device=device, dtype=bool).scatter(1, rearrange(is_dp_idx, 'b p -> (p b) 1'), 1)
-        is_dp = rearrange(is_dp, '(P B) N -> P B N', P=P)
+        is_bp_idx = (repeat(~is_valid_target, '(R B) N -> R B N', R=R).sum(dim=0) + torch.rand((B_IN,N), device=device) * 0.5).argsort(dim=1)[:,:P]
+        is_bp = torch.zeros(P*B_IN, N, device=device, dtype=bool).scatter(1, rearrange(is_bp_idx, 'b p -> (p b) 1'), 1)
+        is_bp = rearrange(is_bp, '(P B) N -> P B N', P=P)
 
-        d_max = min(self.d_max, N)
-        k = torch.randint(0, d_max + 1, (B_IN, 1), device=device)  # how many False per row
-        is_background_idx = (torch.rand(B_IN, N, device=device) + is_dp.any(0)).argsort(dim=1)[:, :d_max]  # 0% chance take is_dp
-        is_mask_background = torch.ones(B_IN, N, dtype=torch.bool, device=device).scatter(1, is_background_idx, torch.arange(d_max, device=device).unsqueeze(0) >= k)
-        is_mask_background_dp = repeat(is_mask_background, 'B N -> P B N', P=P) & (~is_dp)
-        is_selected_background_dp = torch.zeros(P, B_IN, N, dtype=bool, device=device).scatter(2, is_mask_background_dp.int().argsort(2)[:,:,:d_max+1], True)
+        b_max = min(self.b_max, N)
+        k = torch.randint(0, b_max + 1, (B_IN, 1), device=device)  # how many False per row
+        is_background_idx = (torch.rand(B_IN, N, device=device) + is_bp.any(0)).argsort(dim=1)[:, :b_max]  # 0% chance take is_bp
+        is_mask_background = torch.ones(B_IN, N, dtype=torch.bool, device=device).scatter(1, is_background_idx, torch.arange(b_max, device=device).unsqueeze(0) >= k)
+        is_mask_background_bp = repeat(is_mask_background, 'B N -> P B N', P=P) & (~is_bp)
+        is_selected_background_bp = torch.zeros(P, B_IN, N, dtype=bool, device=device).scatter(2, is_mask_background_bp.int().argsort(2)[:,:,:b_max+1], True)
         
-        is_selected_background = is_selected_background_dp[0]  # Any element works
-        is_selected_background_dp = rearrange(is_selected_background_dp, 'P B N -> (P B) N')
-        is_mask_background_dp = rearrange(is_mask_background_dp, 'P B N -> (P B) N')
+        is_selected_background = is_selected_background_bp[0]  # Any element works
+        is_selected_background_bp = rearrange(is_selected_background_bp, 'P B N -> (P B) N')
+        is_mask_background_bp = rearrange(is_mask_background_bp, 'P B N -> (P B) N')
 
-        is_mask = torch.cat([is_mask_background,is_mask_encoder],dim=0)  # GIGA TODO REQUIRES IS D < IS M
+        is_mask = torch.cat([is_mask_background,is_mask_encoder],dim=0)  # GIGA TODO REQUIRES IS B < IS M
         is_selected_encoder = torch.zeros_like(is_mask).scatter(1, torch.rand_like(is_mask.float()).masked_fill(~is_mask, -1).argsort(dim=1)[:, : N - self.mask_m], True)
         is_valid_target = torch.cat([is_mask_background, is_valid_target], dim=0)
 
@@ -801,29 +800,29 @@ class REPR(nn.Module):
         def get_selected(mask, num_selected):
             return torch.zeros_like(mask).scatter(1, torch.rand_like(mask.float()).masked_fill(~mask, -1).argsort(dim=1)[:, : num_selected], True)
         
-        num_selected_addp = max(N-self.mask_m, self.d_max+1)
+        num_selected_ab = max(N-self.mask_m, self.b_max+1)
         is_mask_A = is_mask_encoder
-        is_selected_A = get_selected(is_mask_encoder, num_selected_addp)
-        is_mask_D = is_mask_background
-        is_selected_D = get_selected(is_mask_background, num_selected_addp)
-        is_mask_Dp = is_mask_background_dp
-        is_selected_Dp = get_selected(is_mask_background_dp, num_selected_addp)
-        is_mask_AD = is_mask_A & repeat(is_mask_D, 'B N -> (R B) N', R=R)
-        is_selected_AD = get_selected(is_mask_AD, N - self.mask_m + self.d_max)
-        is_patch_target = is_dp
+        is_selected_A = get_selected(is_mask_encoder, num_selected_ab)
+        is_mask_B = is_mask_background
+        is_selected_B = get_selected(is_mask_background, num_selected_ab)
+        is_mask_Bp = is_mask_background_bp
+        is_selected_Bp = get_selected(is_mask_background_bp, num_selected_ab)
+        is_mask_AB = is_mask_A & repeat(is_mask_B, 'B N -> (R B) N', R=R)
+        is_selected_AB = get_selected(is_mask_AB, N - self.mask_m + self.b_max)
+        is_patch_target = is_bp
 
-        return is_selected_A, is_mask_A, is_selected_D, is_mask_D, is_selected_Dp, is_mask_Dp, is_selected_AD, is_mask_AD, is_patch_target, is_valid_target
+        return is_selected_A, is_mask_A, is_selected_B, is_mask_B, is_selected_Bp, is_mask_Bp, is_selected_AB, is_mask_AB, is_patch_target, is_valid_target
 
 
     def get_mask(self, strategy, B_IN, N, device, R=1):
         if strategy == 'random':
-            return self.sample_m_reprv2_1_random(B_IN, N, device, R=R)
+            return self.sample_mask_random(B_IN, N, device, R=R)
         if strategy == 'block':
-            return self.sample_m_reprv2_1_block(B_IN, N, device, R=R)
+            return self.sample_mask_block(B_IN, N, device, R=R)
         raise ValueError(f'Unknown mask strategy: {strategy}')
 
     @torch.compile
-    def forward_mar_only(self, x, x_target=None):
+    def forward_mar(self, x, x_target=None):
         # Merging the first iteration with different targets
         assert self.in_context_len > 0
 
@@ -839,17 +838,13 @@ class REPR(nn.Module):
             x_p_target = x_target
 
         N = self.num_patches
-        D = self.hidden_size
+        d = self.hidden_size
 
-        P=self.d_num_p
         R=self.batch_repeat_mar
         O=self.diff_repeat
-        S=1
-        U=self.repr_noise_bins
-        V=self.diff_bin_repeat_repr
 
-        is_selected_A, is_mask_A, is_selected_D, is_mask_D, is_selected_Dp, is_mask_Dp, is_selected_AD, is_mask_AD, is_patch_target, is_valid_target = self.get_mask(self.mask_strategy_mar, B_IN, N, device, R=R)
-        is_mask_encoder_AD = rearrange(is_mask_AD[is_selected_AD], '(X m) -> X m', X=R*B_IN)
+        is_selected_A, is_mask_A, is_selected_B, is_mask_B, is_selected_Bp, is_mask_Bp, is_selected_AB, is_mask_AB, is_patch_target, is_valid_target = self.get_mask(self.mask_strategy_mar, B_IN, N, device, R=R)
+        is_mask_encoder_AB = rearrange(is_mask_AB[is_selected_AB], '(X m) -> X m', X=R*B_IN)
 
         def get_factor_pos(is_mask):
             device = is_mask.device
@@ -867,19 +862,19 @@ class REPR(nn.Module):
             
             return factor_pos
         
-        z_AD_factor_pos = get_factor_pos(is_mask_AD)
+        z_AB_factor_pos = get_factor_pos(is_mask_AB)
 
-        z_t1_A_nopos = repeat(z_t1_og_nopos, 'B N D -> (R B) N D', R=R)
+        z_t1_A_nopos = repeat(z_t1_og_nopos, 'B N d -> (R B) N d', R=R)
 
-        z_t1_AD = torch.where(
-            repeat(is_mask_D, 'B N -> (R B) N 1', R=R),
+        z_t1_AB = torch.where(
+            repeat(is_mask_B, 'B N -> (R B) N 1', R=R),
             z_t1_A_nopos,
-            repeat(z_t1_og_nopos, 'B N D -> (R B) N D', R=R),
-        ) + z_AD_factor_pos
+            repeat(z_t1_og_nopos, 'B N d -> (R B) N d', R=R),
+        ) + z_AB_factor_pos
                 
         def get_encoded(z, is_selected, is_mask_encoder):
             B_ = z.size(0)
-            z_e = z[is_selected].view(B_, -1, D)  # e: encoder
+            z_e = z[is_selected].view(B_, -1, d)  # e: encoder
             z_e = torch.cat([repeat(self.in_context_tokens.to(dtype), '1 l d -> b l d', b=B_), z_e], dim=1)
             is_mask_encoder_ic = torch.cat([is_mask_encoder.new_zeros(B_, self.in_context_len), is_mask_encoder], dim=1)
             attn_mask_encoder = self.get_attention_mask(is_mask_encoder_ic)
@@ -887,46 +882,45 @@ class REPR(nn.Module):
                 z_e = block(z_e, partial(self.feat_rope_incontext, m=~is_selected, m_selected=is_mask_encoder), attn_mask=attn_mask_encoder)
             return z_e
         
-        z_e_AD_t1 = get_encoded(z_t1_AD, is_selected_AD, is_mask_encoder_AD)
+        z_e_AB_t1 = get_encoded(z_t1_AB, is_selected_AB, is_mask_encoder_AB)
 
-        z_d_AD_t1_nomaskpos = z_e_AD_t1.new_zeros((R*B_IN,N,D)).masked_scatter(
-            repeat(is_selected_AD, 'B N -> B N D', D=D),
-            z_e_AD_t1[:, self.in_context_len:].flatten(),
+        z_d_AB_t1_nomaskpos = z_e_AB_t1.new_zeros((R*B_IN,N,d)).masked_scatter(
+            repeat(is_selected_AB, 'B N -> B N d', d=d),
+            z_e_AB_t1[:, self.in_context_len:].flatten(),
         )
         z_d = torch.cat([
-            z_e_AD_t1[:, :self.in_context_len],
+            z_e_AB_t1[:, :self.in_context_len],
             torch.where(
-                repeat(is_mask_AD, 'RB N -> RB N 1'),
-                repeat(self.mask_token.to(dtype), '1 1 D -> (R B) N D', R=R, B=B_IN, N=N),
-                z_d_AD_t1_nomaskpos
+                repeat(is_mask_AB, 'RB N -> RB N 1'),
+                repeat(self.mask_token.to(dtype), '1 1 d -> (R B) N d', R=R, B=B_IN, N=N),
+                z_d_AB_t1_nomaskpos
             )
         ], dim=1)
-        z_d = z_d + torch.cat([z_AD_factor_pos.new_zeros(R*B_IN, self.in_context_len, D), z_AD_factor_pos], dim=1)
+        z_d = z_d + torch.cat([z_AB_factor_pos.new_zeros(R*B_IN, self.in_context_len, d), z_AB_factor_pos], dim=1)
         for block_idx, block in enumerate(self.decoder):
             z_d = block(z_d, self.feat_rope_incontext, attn_mask=None)
 
         # Section: Trains such that decoder used to merging multiple encoder inputs.
-        # Tradeoff: This wastes compute by calculating D tokens during A mask. But necessary for constant masks
-        # Masking is coupled here, but correct because ultimately is_mask_D valid check and is_mask_A masking combine to work
-        z_m = repeat(z_d[:,self.in_context_len:][is_mask_A], 'Y D -> (O Y) D', O=O)
-        feats_p_rsb = repeat(x_p_target, 'B N D -> (R S B) N D', R=R, S=S)
-        feats_p_m = repeat(feats_p_rsb[is_mask_A], 'Y D -> (O Y) D', O=O, D=feats_p_rsb.size(-1))
+        # Tradeoff: This wastes compute by calculating B tokens during A mask. But necessary for constant masks
+        # Masking is coupled here, but correct because ultimately is_mask_B valid check and is_mask_A masking combine to work
+        z_m = repeat(z_d[:,self.in_context_len:][is_mask_A], 'Y d -> (O Y) d', O=O)
+        feats_p_rb = repeat(x_p_target, 'B N d -> (R B) N d', R=R)
+        feats_p_m = repeat(feats_p_rb[is_mask_A], 'Y d -> (O Y) d', O=O, d=feats_p_rb.size(-1))
         t_m = torch.where(torch.rand(z_m.size(0), 1, device=device) < 0.1, torch.rand(z_m.size(0), 1, device=device), torch.sigmoid(torch.randn(z_m.size(0), 1, device=device) * self.std_mar + self.mu_mar))
         eps_m = torch.randn_like(feats_p_m)
         feats_p_m_t = t_m * feats_p_m + (1-t_m) * eps_m
         feats_pred = self.diff_mlp(feats_p_m_t, t_m.flatten(), z_m)
-        mse_is_valid = repeat(repeat(is_mask_D, 'B N -> (R S B) N', R=R, S=S)[is_mask_A], 'Y -> (O Y) 1', O=O)
+        mse_is_valid = repeat(repeat(is_mask_B, 'B N -> (R B) N', R=R)[is_mask_A], 'Y -> (O Y) 1', O=O)
         mse_loss = 2*(F.huber_loss(feats_pred*mse_is_valid, feats_p_m*mse_is_valid, reduction='none', delta=10) / (1-t_m).clamp_min(0.33).pow(2)).mean() / mse_is_valid.float().mean()
         
         loss = mse_loss
         return loss
 
     @torch.compile
-    def forward_reprv2_4_repr_jointenc(self, x, x_target=None):
+    def forward_repr(self, x, x_target=None):
         # Merging the first iteration with different targets
-        # Goal: include DP repeat
+        # Goal: include Bp repeat
         assert self.in_context_len > 0
-        assert self.repr_noise_bins == 1
 
 
         B_IN, C, H, W = x.shape
@@ -943,21 +937,19 @@ class REPR(nn.Module):
             z_target = self.feats_embedder(x_target)
 
         N = self.num_patches
-        D = self.hidden_size
+        d = self.hidden_size
 
-        P=self.d_num_p
+        P=self.b_num_p
         R=self.batch_repeat
         R1=self.batch_repeat+1
         O=self.diff_repeat
-        S=1
-        U=self.repr_noise_bins
-        V=self.diff_bin_repeat_repr
+        V=self.diff_repeat_repr
 
-        is_selected_A, is_mask_A, is_selected_D, is_mask_D, is_selected_Dp, is_mask_Dp, is_selected_AD, is_mask_AD, is_patch_target, is_valid_target = self.get_mask(self.mask_strategy_repr, B_IN, N, device, R=R)
-        is_selected_DADp = torch.cat([is_selected_D, is_selected_A, is_selected_Dp], 0)
-        is_mask_DADp = torch.cat([is_mask_D, is_mask_A, is_mask_Dp], 0)
-        is_mask_encoder_DADp = rearrange(is_mask_DADp[is_selected_DADp], '(X m) -> X m', X=(1+R+P)*B_IN)
-        is_mask_encoder_AD = rearrange(is_mask_AD[is_selected_AD], '(X m) -> X m', X=R*B_IN)
+        is_selected_A, is_mask_A, is_selected_B, is_mask_B, is_selected_Bp, is_mask_Bp, is_selected_AB, is_mask_AB, is_patch_target, is_valid_target = self.get_mask(self.mask_strategy_repr, B_IN, N, device, R=R)
+        is_selected_BABp = torch.cat([is_selected_B, is_selected_A, is_selected_Bp], 0)
+        is_mask_BABp = torch.cat([is_mask_B, is_mask_A, is_mask_Bp], 0)
+        is_mask_encoder_BABp = rearrange(is_mask_BABp[is_selected_BABp], '(X m) -> X m', X=(1+R+P)*B_IN)
+        is_mask_encoder_AB = rearrange(is_mask_AB[is_selected_AB], '(X m) -> X m', X=R*B_IN)
 
         def get_factor_pos(is_mask):
             device = is_mask.device
@@ -985,30 +977,30 @@ class REPR(nn.Module):
 
             return factor_pos, factor_pos_pad, patch_rope_idx, pad_rope_idx, cls_rope_idx
         
-        z_DADp_factor_pos, z_DADp_factor_pos_pad, z_DADp_encoder_rope_idx, z_DADp_factorpad_rope_idx, z_DADp_cls_rope_idx = get_factor_pos(is_mask_DADp)
-        z_AD_factor_pos, z_AD_factor_pos_pad, z_AD_encoder_rope_idx, z_AD_factorpad_rope_idx, z_AD_cls_rope_idx = get_factor_pos(is_mask_AD)
+        z_BABp_factor_pos, z_BABp_factor_pos_pad, z_BABp_encoder_rope_idx, z_BABp_factorpad_rope_idx, z_BABp_cls_rope_idx = get_factor_pos(is_mask_BABp)
+        z_AB_factor_pos, z_AB_factor_pos_pad, z_AB_encoder_rope_idx, z_AB_factorpad_rope_idx, z_AB_cls_rope_idx = get_factor_pos(is_mask_AB)
 
-        z_t1_A_nopos = repeat(z_t1_og_nopos, 'B N D -> (R B) N D', R=R)
+        z_t1_A_nopos = repeat(z_t1_og_nopos, 'B N d -> (R B) N d', R=R)
 
-        z_t1_DADp = torch.cat([
+        z_t1_BABp = torch.cat([
             z_t1_og_nopos,
             z_t1_A_nopos,
             torch.where(
                 rearrange(is_patch_target, 'P B N -> (P B) N 1'), 
-                repeat(z_target, "B N D -> (P B) N D", P=P) + rearrange(self.is_d_embed.to(dtype), '1 D -> 1 1 D'), 
-                repeat(z_t1_og_nopos, 'B N D -> (P B) N D', P=P),
+                repeat(z_target, "B N d -> (P B) N d", P=P) + rearrange(self.is_b_embed.to(dtype), '1 d -> 1 1 d'),
+                repeat(z_t1_og_nopos, 'B N d -> (P B) N d', P=P),
             )
-        ], dim=0) + z_DADp_factor_pos
-        z_t1_AD = torch.where(
-            repeat(is_mask_D, 'B N -> (R B) N 1', R=R),
+        ], dim=0) + z_BABp_factor_pos
+        z_t1_AB = torch.where(
+            repeat(is_mask_B, 'B N -> (R B) N 1', R=R),
             z_t1_A_nopos,
-            repeat(z_t1_og_nopos, 'B N D -> (R B) N D', R=R),
-        ) + z_AD_factor_pos
+            repeat(z_t1_og_nopos, 'B N d -> (R B) N d', R=R),
+        ) + z_AB_factor_pos
                 
 
         def get_encoded(z, is_selected, is_mask_encoder):
             B_ = z.size(0)
-            z_e = z[is_selected].view(B_, -1, D)  # e: encoder
+            z_e = z[is_selected].view(B_, -1, d)  # e: encoder
             z_e = torch.cat([repeat(self.in_context_tokens.to(dtype), '1 l d -> b l d', b=B_), z_e], dim=1)
             is_mask_encoder_ic = torch.cat([is_mask_encoder.new_zeros(B_, self.in_context_len), is_mask_encoder], dim=1)
             attn_mask_encoder = self.get_attention_mask(is_mask_encoder_ic)
@@ -1016,62 +1008,62 @@ class REPR(nn.Module):
                 z_e = block(z_e, partial(self.feat_rope_incontext, m=~is_selected, m_selected=is_mask_encoder), attn_mask=attn_mask_encoder)
             return z_e
         
-        z_e_DADp_t1 = get_encoded(z_t1_DADp, is_selected_DADp, is_mask_encoder_DADp)
-        z_e_AD_t1 = get_encoded(z_t1_AD, is_selected_AD, is_mask_encoder_AD)
+        z_e_BABp_t1 = get_encoded(z_t1_BABp, is_selected_BABp, is_mask_encoder_BABp)
+        z_e_AB_t1 = get_encoded(z_t1_AB, is_selected_AB, is_mask_encoder_AB)
 
-        is_mask_DAD = torch.cat([is_mask_D, is_mask_AD], dim=0)
-        z_d_D_t1_nomaskpos = z_e_DADp_t1.new_zeros((B_IN,N,D)).masked_scatter(
-            repeat(is_selected_D, 'B N -> B N D', D=D),
-            z_e_DADp_t1[:B_IN, self.in_context_len:].flatten(),
+        is_mask_BAB = torch.cat([is_mask_B, is_mask_AB], dim=0)
+        z_d_B_t1_nomaskpos = z_e_BABp_t1.new_zeros((B_IN,N,d)).masked_scatter(
+            repeat(is_selected_B, 'B N -> B N d', d=d),
+            z_e_BABp_t1[:B_IN, self.in_context_len:].flatten(),
         )
-        z_d_AD_t1_nomaskpos = z_e_AD_t1.new_zeros((R*B_IN,N,D)).masked_scatter(
-            repeat(is_selected_AD, 'B N -> B N D', D=D),
-            z_e_AD_t1[:, self.in_context_len:].flatten(),
+        z_d_AB_t1_nomaskpos = z_e_AB_t1.new_zeros((R*B_IN,N,d)).masked_scatter(
+            repeat(is_selected_AB, 'B N -> B N d', d=d),
+            z_e_AB_t1[:, self.in_context_len:].flatten(),
         )
-        z_d_DAD_t1_nomaskpos = torch.cat([z_d_D_t1_nomaskpos, z_d_AD_t1_nomaskpos], dim=0)
+        z_d_BAB_t1_nomaskpos = torch.cat([z_d_B_t1_nomaskpos, z_d_AB_t1_nomaskpos], dim=0)
         z_d = torch.cat([
-            torch.cat([z_e_DADp_t1[:B_IN, :self.in_context_len], z_e_AD_t1[:, :self.in_context_len]], dim=0),
+            torch.cat([z_e_BABp_t1[:B_IN, :self.in_context_len], z_e_AB_t1[:, :self.in_context_len]], dim=0),
             torch.where(
-                repeat(is_mask_DAD, 'RB N -> RB N 1'),
-                repeat(self.mask_token.to(dtype), '1 1 D -> (R B) N D', R=1+R, B=B_IN, N=N),
-                z_d_DAD_t1_nomaskpos
+                repeat(is_mask_BAB, 'RB N -> RB N 1'),
+                repeat(self.mask_token.to(dtype), '1 1 d -> (R B) N d', R=1+R, B=B_IN, N=N),
+                z_d_BAB_t1_nomaskpos
             )
         ], dim=1)
-        z_DAD_factor_pos = torch.cat([z_DADp_factor_pos[:B_IN], z_AD_factor_pos], dim=0)
-        z_d = z_d + torch.cat([z_DAD_factor_pos.new_zeros((1+R)*B_IN, self.in_context_len, D), z_DAD_factor_pos], dim=1)
+        z_BAB_factor_pos = torch.cat([z_BABp_factor_pos[:B_IN], z_AB_factor_pos], dim=0)
+        z_d = z_d + torch.cat([z_BAB_factor_pos.new_zeros((1+R)*B_IN, self.in_context_len, d), z_BAB_factor_pos], dim=1)
         for block_idx, block in enumerate(self.decoder):
             z_d = block(z_d, self.feat_rope_incontext, attn_mask=None)
 
         # Section: Trains such that decoder used to merging multiple encoder inputs.
-        # Tradeoff: This wastes compute by calculating D tokens during A mask. But necessary for constant masks
-        # Masking is coupled here, but correct because ultimately is_mask_D valid check and is_mask_A masking combine to work
-        is_mask_DA = torch.cat([is_mask_D, is_mask_A], dim=0)
-        z_m = repeat(z_d[:,self.in_context_len:][is_mask_DA], 'Y D -> (O Y) D', O=O)
-        feats_p_rsb = repeat(x_p_target, 'B N D -> (R S B) N D', R=R1, S=S)
-        feats_p_m = repeat(feats_p_rsb[is_mask_DA], 'Y D -> (O Y) D', O=O, D=feats_p_rsb.size(-1))
+        # Tradeoff: This wastes compute by calculating B tokens during A mask. But necessary for constant masks
+        # Masking is coupled here, but correct because ultimately is_mask_B valid check and is_mask_A masking combine to work
+        is_mask_BA = torch.cat([is_mask_B, is_mask_A], dim=0)
+        z_m = repeat(z_d[:,self.in_context_len:][is_mask_BA], 'Y d -> (O Y) d', O=O)
+        feats_p_rb = repeat(x_p_target, 'B N d -> (R B) N d', R=R1)
+        feats_p_m = repeat(feats_p_rb[is_mask_BA], 'Y d -> (O Y) d', O=O, d=feats_p_rb.size(-1))
         t_m = torch.where(torch.rand(z_m.size(0), 1, device=device) < 0.1, torch.rand(z_m.size(0), 1, device=device), torch.sigmoid(torch.randn(z_m.size(0), 1, device=device) * self.std_mar + self.mu_mar))
         eps_m = torch.randn_like(feats_p_m)
         feats_p_m_t = t_m * feats_p_m + (1-t_m) * eps_m
         feats_pred = self.diff_mlp(feats_p_m_t, t_m.flatten(), z_m)
-        mse_is_valid = repeat(repeat(is_mask_D, 'B N -> (R S B) N', R=R1, S=S)[is_mask_DA], 'Y -> (O Y) 1', O=O)
+        mse_is_valid = repeat(repeat(is_mask_B, 'B N -> (R B) N', R=R1)[is_mask_BA], 'Y -> (O Y) 1', O=O)
         mse_loss = 2*(F.huber_loss(feats_pred*mse_is_valid, feats_p_m*mse_is_valid, reduction='none', delta=10) / (1-t_m).clamp_min(0.33).pow(2)).mean() / mse_is_valid.float().mean()
         
         with torch.no_grad():
-            z_d_rs = rearrange(z_d[:,self.in_context_len:], '(R S B) N D -> R S B N D', R=R1, S=S)
-            z_dp_rsp = z_d_rs[:, :, torch.arange(B_IN, device=device), is_patch_target.int().argmax(-1)].float()
-            z_dp_uvprs = repeat(z_dp_rsp, 'R S P B D -> (U V P R S B) D', U=U, V=V)
+            z_decoder_r = rearrange(z_d[:,self.in_context_len:], '(R B) N d -> R B N d', R=R1)
+            z_bp_rp = z_decoder_r[:, torch.arange(B_IN, device=device), is_patch_target.int().argmax(-1)].float()
+            z_bp_vpr = repeat(z_bp_rp, 'R P B d -> (V P R B) d', V=V)
 
-            x_dp_uvprs_t1 = repeat(repeat(x_p_target, 'B N D -> P B N D', P=P)[is_patch_target], '(P B) D -> (U V P R S B) D', P=P, R=R1, S=S, U=U, V=V).float()
-            tu_dp_uvprs = torch.sigmoid(torch.randn(U,V,P,S,B_IN, device=device) * self.std_repr + self.mu_repr) * (self.noise_bin_limits[1:]-self.noise_bin_limits[:-1]).float().view(-1,1,1,1,1) + self.noise_bin_limits[:-1].view(-1,1,1,1,1)
-            tu_dp_uvprs = repeat(tu_dp_uvprs, 'U V P S B -> (U V P R S B) 1', R=R1).float()
-            eps_dp_uvprs_tu = repeat(torch.randn(U,V,P,S,B_IN,x_dp_uvprs_t1.size(-1),device=device), 'U V P S B D -> (U V P R S B) D', R=R1).float()
-            x_dp_uvprs_tu = tu_dp_uvprs * x_dp_uvprs_t1 + (1-tu_dp_uvprs) * eps_dp_uvprs_tu
+            x_bp_vpr = repeat(repeat(x_p_target, 'B N d -> P B N d', P=P)[is_patch_target], '(P B) d -> (V P R B) d', P=P, R=R1, V=V).float()
+            t_bp_vpr = torch.sigmoid(torch.randn(V,P,B_IN, device=device) * self.std_repr + self.mu_repr)
+            t_bp_vpr = repeat(t_bp_vpr, 'V P B -> (V P R B) 1', R=R1).float()
+            eps_bp_vpr = repeat(torch.randn(V,P,B_IN,x_bp_vpr.size(-1),device=device), 'V P B d -> (V P R B) d', R=R1).float()
+            x_bp_vpr_noisy = t_bp_vpr * x_bp_vpr + (1-t_bp_vpr) * eps_bp_vpr
 
-            x_dp_qprs_pred = self.diff_mlp(x_dp_uvprs_tu.to(dtype), tu_dp_uvprs.flatten().to(dtype), z_dp_uvprs.to(dtype)).float()
+            x_bp_vpr_pred = self.diff_mlp(x_bp_vpr_noisy.to(dtype), t_bp_vpr.flatten().to(dtype), z_bp_vpr.to(dtype)).float()
 
-            freq_weight = 1/2*tu_dp_uvprs/(1-tu_dp_uvprs).clamp_min(0.33).pow(2)
-            h_p_uvprb_pred_only = freq_weight * (x_dp_qprs_pred - x_dp_uvprs_t1).pow(2).sum(-1, True)
-            h_p_rbpuv_pred_only = rearrange(h_p_uvprb_pred_only, '(U V P R B) 1 -> R B P U V', P=P, R=R1, U=U, V=V).to(dtype)
+            freq_weight = 1/2*t_bp_vpr/(1-t_bp_vpr).clamp_min(0.33).pow(2)
+            h_p_vprb = freq_weight * (x_bp_vpr_pred - x_bp_vpr).pow(2).sum(-1, True)
+            h_p_rbpv = rearrange(h_p_vprb, '(V P R B) 1 -> R B P V', P=P, R=R1, V=V).to(dtype)
 
         # REPR Calculation
         def get_repr_encoder(z_e, is_selected, is_mask_encoder):
@@ -1093,51 +1085,47 @@ class REPR(nn.Module):
                 repr_tokens = block(repr_tokens, z_e, q_rope, k_rope, attn_mask=attn_mask)
             return repr_tokens
 
-        if self.is_repr_encoderdecoder:
-            z_re_DADp_t1 = get_repr_encoder(z_e_DADp_t1, is_selected_DADp, is_mask_encoder_DADp)
-        else:
-            z_re_DADp_t1 = z_e_DADp_t1
+        z_re_BABp_t1 = get_repr_encoder(z_e_BABp_t1, is_selected_BABp, is_mask_encoder_BABp)
 
-        z_DADp_t1_repr = get_repr_decoder(z_re_DADp_t1, z_DADp_factor_pos_pad, z_DADp_factorpad_rope_idx, z_DADp_encoder_rope_idx[is_selected_DADp].view((1+R+P)*B_IN,-1), z_DADp_cls_rope_idx, is_mask_encoder_DADp)
-        z_DA_t1_repr = rearrange(self.repr_final_layer(z_DADp_t1_repr[:(1+R)*B_IN]), '(R b) q d -> R b 1 q d', R=R1)
-        z_Dp_t1_repr = repeat(self.repr_final_layer(z_DADp_t1_repr[(1+R)*B_IN:]), '(P b) q (U d) -> b P U q d', P=P, U=U)
-        z_t1_repr_global = rearrange(self.repr_final_layer_global(z_re_DADp_t1[:(1+R)*B_IN, :self.in_context_len]), '(R b) C d -> R b 1 1 (C d)', R=R1)
-        z_Dp_t1_repr_global = repeat(self.repr_final_layer_global(z_re_DADp_t1[(1+R)*B_IN:, :self.in_context_len]), '(P b) C d -> b P U (C d)', P=P, U=U)
+        z_BABp_t1_repr = get_repr_decoder(z_re_BABp_t1, z_BABp_factor_pos_pad, z_BABp_factorpad_rope_idx, z_BABp_encoder_rope_idx[is_selected_BABp].view((1+R+P)*B_IN,-1), z_BABp_cls_rope_idx, is_mask_encoder_BABp)
+        z_BA_t1_repr = rearrange(self.repr_final_layer(z_BABp_t1_repr[:(1+R)*B_IN]), '(R b) q d -> R b 1 q d', R=R1)
+        z_Bp_t1_repr = rearrange(self.repr_final_layer(z_BABp_t1_repr[(1+R)*B_IN:]), '(P b) q d -> b P q d', P=P)
+        z_t1_repr_global = rearrange(self.repr_final_layer_global(z_re_BABp_t1[:(1+R)*B_IN, :self.in_context_len]), '(R b) C d -> R b 1 (C d)', R=R1)
+        z_Bp_t1_repr_global = rearrange(self.repr_final_layer_global(z_re_BABp_t1[(1+R)*B_IN:, :self.in_context_len]), '(P b) C d -> b P (C d)', P=P)
 
-        z_DA_t1_repr = torch.where(torch.rand(z_DA_t1_repr.size(0),device=device).view(-1,1,1,1,1) < self.pad_dropout, z_DA_t1_repr*self.pad_dropout_mask.to(dtype), z_DA_t1_repr)
+        z_BA_t1_repr = torch.where(torch.rand(z_BA_t1_repr.size(0),device=device).view(-1,1,1,1,1) < self.pad_dropout, z_BA_t1_repr*self.pad_dropout_mask.to(dtype), z_BA_t1_repr)
 
         # MINI TODO REMOVE IS EMPTY
-        is_empty_DA = is_mask_DA.all(-1)
-        z_DA_t1_repr = torch.where(is_empty_DA.view(R1, B_IN, 1, 1, 1), 0, z_DA_t1_repr)
-        z_t1_repr_global = torch.where(is_empty_DA.view(R1, B_IN, 1, 1, 1), 0, z_t1_repr_global)
-        z_DA_t1_repr = repeat(z_DA_t1_repr, 'R b P q D -> R b P U q D', U=U) # R b P U q d
-        z_D_t1_repr = z_DA_t1_repr[:1]
-        z_A_t1_repr = z_DA_t1_repr[1:]
-        z_D_t1_repr_global = z_t1_repr_global[:1]
+        is_empty_BA = is_mask_BA.all(-1)
+        z_BA_t1_repr = torch.where(is_empty_BA.view(R1, B_IN, 1, 1, 1), 0, z_BA_t1_repr)
+        z_t1_repr_global = torch.where(is_empty_BA.view(R1, B_IN, 1, 1), 0, z_t1_repr_global)
+        z_B_t1_repr = z_BA_t1_repr[:1]
+        z_A_t1_repr = z_BA_t1_repr[1:]
+        z_B_t1_repr_global = z_t1_repr_global[:1]
         z_A_t1_repr_global = z_t1_repr_global[1:]
 
-        is_valid_pmi = reduce(~(repeat(~is_valid_target, '(R b) n -> R b P n', R=R1, P=P) & repeat(is_patch_target, 'P b n -> R b P n', R=R1)), 'R b P n -> R b P 1', 'all')  # don't allow loss for: ~is_mask and is_dp
-        is_valid_D = is_valid_pmi[:1]
+        is_valid_pmi = reduce(~(repeat(~is_valid_target, '(R b) n -> R b P n', R=R1, P=P) & repeat(is_patch_target, 'P b n -> R b P n', R=R1)), 'R b P n -> R b P', 'all')  # don't allow loss for: ~is_mask and is_bp
+        is_valid_B = is_valid_pmi[:1]
         is_valid_A = is_valid_pmi[1:]
-        is_valid = is_valid_D & is_valid_A
+        is_valid = is_valid_B & is_valid_A
 
-        h_p_given_D_preintegration = h_p_rbpuv_pred_only[:1]
-        h_p_given_DA_preintegration = h_p_rbpuv_pred_only[1:]
+        h_p_given_B_preintegration = h_p_rbpv[:1]
+        h_p_given_BA_preintegration = h_p_rbpv[1:]
 
-        pmi_pred = torch.einsum('rbuqd,bpuqd->rbpu', z_A_t1_repr[:,:,0], z_Dp_t1_repr - z_D_t1_repr[0]) / (2 * z_A_t1_repr.size(-1) * z_A_t1_repr.size(-2)**0.5) * D**0.5  # GIGA TODO USE REPR HERE!
-        pmi_pred_global = torch.einsum('rbud,bpud->rbpu', z_A_t1_repr_global[:,:,0], z_Dp_t1_repr_global - z_D_t1_repr_global[0]) / (2 * z_A_t1_repr_global.size(-1)**0.5)
-        pmi_target = (h_p_given_D_preintegration - h_p_given_DA_preintegration).mean(-1)  # GIGA TODO THIS CLAMPING IS ONLY GOOD FOR PIXELS (BUT SANCHECKED)
+        pmi_pred = torch.einsum('rbqd,bpqd->rbp', z_A_t1_repr[:,:,0], z_Bp_t1_repr - z_B_t1_repr[0]) / (2 * z_A_t1_repr.size(-1) * z_A_t1_repr.size(-2)**0.5) * d**0.5  # GIGA TODO USE REPR HERE!
+        pmi_pred_global = torch.einsum('rbd,bpd->rbp', z_A_t1_repr_global[:,:,0], z_Bp_t1_repr_global - z_B_t1_repr_global[0]) / (2 * z_A_t1_repr_global.size(-1)**0.5)
+        pmi_target = (h_p_given_B_preintegration - h_p_given_BA_preintegration).mean(-1)  # GIGA TODO THIS CLAMPING IS ONLY GOOD FOR PIXELS (BUT SANCHECKED)
 
         # Factorization has an optimum at zero, so huber should be fine, no? Only kind of due to E[PMI est error], but PMI est bias dominates regardless
-        repr_loss = (2*F.huber_loss(pmi_pred, pmi_target, reduction='none', delta=self.repr_delta) * is_valid / reduce(is_valid.bfloat16(), 'R b P U -> R b 1 1', 'mean').clamp_min(1e-5)).mean()
-        repr_loss_global = (2*F.huber_loss(pmi_pred_global, pmi_target, reduction='none', delta=self.repr_delta) * is_valid / reduce(is_valid.bfloat16(), 'R b P U -> R b 1 1', 'mean').clamp_min(1e-5)).mean()
+        repr_loss = (2*F.huber_loss(pmi_pred, pmi_target, reduction='none', delta=self.repr_delta) * is_valid / reduce(is_valid.bfloat16(), 'R b P -> R b 1', 'mean').clamp_min(1e-5)).mean()
+        repr_loss_global = (2*F.huber_loss(pmi_pred_global, pmi_target, reduction='none', delta=self.repr_delta) * is_valid / reduce(is_valid.bfloat16(), 'R b P -> R b 1', 'mean').clamp_min(1e-5)).mean()
 
         loss = mse_loss + self.repr_loss_weight * repr_loss + self.repr_loss_weight * repr_loss_global
         return loss, mse_loss.detach().clone(), repr_loss.detach().clone(), repr_loss_global.detach().clone()
 
 
     @torch.compile
-    def forward_reprv2_4_feats(self, x, num_mask_tokens=0, return_padded=True):
+    def forward_feats(self, x, num_mask_tokens=0, return_padded=True):
         assert self.in_context_len > 0
 
         B_IN, C, H, W = x.shape
@@ -1147,7 +1135,7 @@ class REPR(nn.Module):
         dtype = z_t1_og_nopos.dtype
 
         N = self.num_patches
-        D = self.hidden_size
+        d = self.hidden_size
         R=1
 
         # Preserve the zero-mask path's random-number order during training.
@@ -1185,11 +1173,11 @@ class REPR(nn.Module):
         
         z_factor_pos, z_factor_pos_pad, z_patch_rope_idx, z_pad_rope_idx, z_cls_rope_idx = get_factor_pos(is_mask_rb)
 
-        z_t1 = repeat(z_t1_og_nopos, 'B N D -> (R B) N D', R=R) + z_factor_pos
+        z_t1 = repeat(z_t1_og_nopos, 'B N d -> (R B) N d', R=R) + z_factor_pos
                 
         def get_encoded(z, is_selected, is_mask_encoder):
             B_ = z.size(0)
-            z_e = z[is_selected].view(B_, -1, D)  # e: encoder
+            z_e = z[is_selected].view(B_, -1, d)  # e: encoder
             z_e = torch.cat([repeat(self.in_context_tokens.to(dtype), '1 l d -> b l d', b=B_), z_e], dim=1)
             is_mask_encoder_ic = torch.cat([is_mask_encoder.new_zeros(B_, self.in_context_len), is_mask_encoder], dim=1)
             attn_mask_encoder = self.get_attention_mask(is_mask_encoder_ic)
@@ -1206,10 +1194,7 @@ class REPR(nn.Module):
                 z_e = block(z_e, partial(self.feat_rope_incontext, m=~is_selected, m_selected=is_mask_encoder), attn_mask=attn_mask_encoder)
             return z_e
 
-        if self.is_repr_encoderdecoder:
-            z_re_t1 = get_repr_encoder(z_e_t1, is_selected_rb, is_mask_encoder_rb)
-        else:
-            z_re_t1 = z_e_t1
+        z_re_t1 = get_repr_encoder(z_e_t1, is_selected_rb, is_mask_encoder_rb)
 
         def get_repr(z_e, repr_factor_pos_pad, factorpad_rope_idx, encoder_rope_idx, cls_rope_idx, is_mask_encoder):
             is_mask_encoder_ic = torch.concatenate([is_mask_encoder.new_zeros(is_mask_encoder.size(0), self.in_context_len), is_mask_encoder], dim=1)
@@ -1235,15 +1220,6 @@ class REPR(nn.Module):
         return z_t1_repr, z_t1_repr_global
 
 
-    def forward_repr_22(self, x, x_target=None):
-        loss, mse_loss, repr_loss, repr_loss_global = self.forward_reprv2_4_repr_jointenc(x, x_target)
-        return loss, {
-            'mse_loss': mse_loss.item(),
-            'repr_loss': repr_loss.item(),
-            'repr_loss_global': repr_loss_global.item(),
-        }
-
-
 def REPR_XT_16(**kwargs):
     return REPR(depth=18, hidden_size=256, num_heads=4,
                patch_size=16, decoder_depth=6, **kwargs)
@@ -1264,7 +1240,7 @@ def REPR_L_16(**kwargs):
     return REPR(depth=18, hidden_size=1024, num_heads=16,
                patch_size=16, decoder_depth=6, **kwargs)
 
-REPR_models = {
+REPR_MODELS = {
     'REPR-XT/16': REPR_XT_16,
     'REPR-T/16': REPR_T_16,
     'REPR-S/16': REPR_S_16,

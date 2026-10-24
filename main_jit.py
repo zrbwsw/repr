@@ -19,7 +19,7 @@ import util.misc as misc
 
 from engine_jit import train_one_epoch
 
-from denoiser_mar import DenoiserMAR
+from denoiser_mar import ReprDenoiser
 
 
 def get_args_parser():
@@ -81,8 +81,8 @@ def get_args_parser():
 
     # REPR training
     parser.add_argument('--denoiser', default='denoiser_mar', choices=['denoiser_mar'])
-    parser.add_argument('--denoiser_mode', default='repr_noiseaug_mar4',
-                        choices=['mar', 'repr_noiseaug_mar4', 'repr_mar4_seconditer', 'get_stats'])
+    parser.add_argument('--denoiser_mode', default='repr_mar',
+                        choices=['mar', 'repr_mar', 'repr_mar_featspred', 'get_stats'])
     parser.add_argument('--repr_version', '--version', default='22', choices=['22'])
     parser.add_argument('--decay_epochs', type=int, default=0, metavar='N',
                         help='Epochs to linearly decay LR at the end of training')
@@ -94,23 +94,22 @@ def get_args_parser():
                         help='Independent GPIC shard shuffle seed; change on resume for a fresh shard order')
     parser.add_argument('--dataset_size', default=1281167, type=int, help='Image budget per virtual epoch (defaults to ImageNet size)')
     parser.add_argument('--prefetch_factor', default=6, type=int)
-    parser.add_argument('--find_unused_parameters', action='store_true',
+    parser.add_argument('--find_unused_parameters', action='store_true', default=True,
                         help='Enable DDP unused-parameter detection')
     parser.add_argument('--override_optimizer', action='store_true')
     parser.add_argument('--in_context_len', type=int, default=1)
     parser.add_argument('--is_first_iter', default=True, type=lambda value: value.lower() == 'true')
     parser.add_argument('--frozen_is_first_iter', default=True, type=lambda value: value.lower() == 'true',
                         help='Set False when using a second-iteration teacher for third-iteration training')
-    parser.add_argument('--is_repr_encoderdecoder', action='store_true')
     parser.add_argument('--repr_dim', type=int, default=4096)
     parser.add_argument('--diff_mlp_depth', type=int, default=3)
     parser.add_argument('--batch_repeat', type=int, default=1)
     parser.add_argument('--batch_repeat_mar', type=int, default=1)
     parser.add_argument('--global_batch_repeat', type=int, default=1)
     parser.add_argument('--diff_repeat', type=int, default=4)
-    parser.add_argument('--d_num_p', type=int, default=8)
+    parser.add_argument('--b_num_p', '--d_num_p', type=int, default=8)
     parser.add_argument('--diff_repeat_repr', type=int, default=32)
-    parser.add_argument('--d_max', type=int, default=48)
+    parser.add_argument('--b_max', '--d_max', type=int, default=48)
     parser.add_argument('--mask_m', type=int, default=256 - 76)
     parser.add_argument('--mask_strategy_mar', choices=['random', 'block'], default='block')
     parser.add_argument('--mask_strategy_repr', choices=['random', 'block'], default='block')
@@ -122,7 +121,6 @@ def get_args_parser():
                         help='Initial factor-pad dropout probability (defaults to --pad_dropout)')
     parser.add_argument('--pad_dropout_decay_epochs', type=int, default=100,
                         help='Epoch at which factor-pad dropout reaches its final value')
-    parser.add_argument('--repr_noise_bins', type=int, default=1)
     parser.add_argument('--mu_repr', type=float, default=-1.2)
     parser.add_argument('--std_repr', type=float, default=1.2)
     parser.add_argument('--mu_mar', type=float, default=-1.2)
@@ -140,11 +138,11 @@ def get_args_parser():
 def main(args):
     if args.global_batch_repeat < 1 or args.batch_size % args.global_batch_repeat:
         raise ValueError('global_batch_repeat must be positive and divide batch_size')
-    if args.denoiser_mode == 'repr_mar4_seconditer':
+    if args.denoiser_mode == 'repr_mar_featspred':
         if args.is_first_iter or not args.frozen_checkpoint_model_path:
             raise ValueError('Second iteration requires --is_first_iter False and --frozen_checkpoint_model_path')
     elif args.denoiser_mode != 'get_stats' and not args.is_first_iter:
-        raise ValueError('Use --denoiser_mode repr_mar4_seconditer for second-iteration training')
+        raise ValueError('Use --denoiser_mode repr_mar_featspred for second-iteration training')
     if args.dataset == 'imagenet':
         paths = sorted(glob.glob(os.path.join(args.data_path, 'train', '*.tar')))
         if not paths:
@@ -218,7 +216,7 @@ def main(args):
     torch._dynamo.config.optimize_ddp = False
 
     # Create denoiser
-    model = DenoiserMAR(args)
+    model = ReprDenoiser(args)
 
     print("Model =", model)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -265,7 +263,7 @@ def main(args):
     else:
         print("Training from scratch")
 
-    if args.denoiser_mode == 'repr_mar4_seconditer':
+    if args.denoiser_mode == 'repr_mar_featspred':
         frozen_checkpoint = torch.load(args.frozen_checkpoint_model_path, map_location='cpu', weights_only=False)
         model_without_ddp.frozen_net.load_state_dict({
             key[len('net.'):]: value for key, value in frozen_checkpoint['model'].items()
@@ -293,7 +291,7 @@ def main(args):
 
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
-        # DenoiserMAR does not maintain EMA weights.
+        # ReprDenoiser does not maintain EMA weights.
         checkpoint_names = []
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
             checkpoint_names.append('last')
