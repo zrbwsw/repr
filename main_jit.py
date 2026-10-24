@@ -29,8 +29,6 @@ def get_args_parser():
     parser.add_argument('--model', default='REPR-B/16', type=str, metavar='MODEL',
                         help='Name of the model to train')
     parser.add_argument('--img_size', default=256, type=int, help='Image size')
-    parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
-    parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
@@ -48,15 +46,6 @@ def get_args_parser():
                         help='Learning rate schedule')
     parser.add_argument('--weight_decay', type=float, default=0.0,
                         help='Weight decay (default: 0.0)')
-    parser.add_argument('--ema_decay1', type=float, default=0.9999,
-                        help='The first ema to track. Use the first ema for sampling by default.')
-    parser.add_argument('--ema_decay2', type=float, default=0.9996,
-                        help='The second ema to track')
-    parser.add_argument('--P_mean', default=-0.8, type=float)
-    parser.add_argument('--P_std', default=0.8, type=float)
-    parser.add_argument('--noise_scale', default=1.0, type=float)
-    parser.add_argument('--t_eps', default=5e-2, type=float)
-    parser.add_argument('--label_drop_prob', default=0.1, type=float)
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -70,7 +59,6 @@ def get_args_parser():
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='Path to ImageNet WebDataset shards (train/*.tar)')
-    parser.add_argument('--class_num', default=1000, type=int)
 
     # checkpointing
     parser.add_argument('--output_dir', default='./output_dir',
@@ -90,7 +78,6 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='URL used to set up distributed training')
-
 
     # REPR training
     parser.add_argument('--denoiser', default='denoiser_mar', choices=['denoiser_mar'])
@@ -112,12 +99,11 @@ def get_args_parser():
     parser.add_argument('--override_optimizer', action='store_true')
     parser.add_argument('--in_context_len', type=int, default=1)
     parser.add_argument('--is_first_iter', default=True, type=lambda value: value.lower() == 'true')
-    parser.add_argument('--frozen_is_first_iter', default=True, type=lambda value: value.lower() == 'true')
-    parser.add_argument('--is_rope_bug_fixed', default=True, type=lambda value: value.lower() == 'true')
+    parser.add_argument('--frozen_is_first_iter', default=True, type=lambda value: value.lower() == 'true',
+                        help='Set False when using a second-iteration teacher for third-iteration training')
     parser.add_argument('--is_repr_encoderdecoder', action='store_true')
     parser.add_argument('--repr_dim', type=int, default=4096)
     parser.add_argument('--diff_mlp_depth', type=int, default=3)
-    parser.add_argument('--diff_mlp_swiglu', action='store_true')
     parser.add_argument('--batch_repeat', type=int, default=1)
     parser.add_argument('--batch_repeat_mar', type=int, default=1)
     parser.add_argument('--global_batch_repeat', type=int, default=1)
@@ -126,8 +112,8 @@ def get_args_parser():
     parser.add_argument('--diff_repeat_repr', type=int, default=32)
     parser.add_argument('--d_max', type=int, default=48)
     parser.add_argument('--mask_m', type=int, default=256 - 76)
-    parser.add_argument('--mask_strategy_mar', choices=['random', 'block', 'square'], default='block')
-    parser.add_argument('--mask_strategy_repr', choices=['random', 'block', 'square'], default='block')
+    parser.add_argument('--mask_strategy_mar', choices=['random', 'block'], default='block')
+    parser.add_argument('--mask_strategy_repr', choices=['random', 'block'], default='block')
     parser.add_argument('--repr_loss_weight', type=float, default=0.1)
     parser.add_argument('--repr_delta', type=float, default=0.2)
     parser.add_argument('--pad_dropout', type=float, default=0.01,
@@ -145,19 +131,8 @@ def get_args_parser():
     parser.add_argument('--frozen_model', default='REPR-S/16', type=str)
     parser.add_argument('--teacher_feats_mul', default=1.0, type=float)
 
-    # Constructor defaults for the copied denoiser's unused modes.
-    parser.set_defaults(
-        condition_on_class=False, num_patch_heads=4, diff_mlp_width=1024,
-        pmi_target_mul=1.0, source_time_repeat=1, num_repr_heads=1,
-        masked_selfdistill_mask_ratio=0.75, masked_selfdistill_loss_weight=1.0,
-        repr_loss_weight_iter2=0.1, imagenet_loss_weight=0.0,
-        add_input_noise=False, do_simclr_augs=False, noise_a=False,
-        mu_repr_2=-1.2, std_repr_2=1.2, mu_mar_2=-1.2, std_mar_2=1.2,
-        frozen_version='15', pmi_attn_mode='alternate', hide_pmi_source=False,
-        offline_feats_mul=1.0, train_subset_size=None,
-        sampling_method='heun', num_sampling_steps=50, cfg=1.0,
-        interval_min=0.0, interval_max=1.0,
-    )
+    # GPIC uses the full stream.
+    parser.set_defaults(train_subset_size=None)
 
     return parser
 
