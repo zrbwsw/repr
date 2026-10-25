@@ -823,7 +823,6 @@ class REPR(nn.Module):
 
     @torch.compile
     def forward_mar(self, x, x_target=None):
-        # Merging the first iteration with different targets
         assert self.in_context_len > 0
 
         B_IN, C, H, W = x.shape
@@ -900,9 +899,6 @@ class REPR(nn.Module):
         for block_idx, block in enumerate(self.decoder):
             z_d = block(z_d, self.feat_rope_incontext, attn_mask=None)
 
-        # Section: Trains such that decoder used to merging multiple encoder inputs.
-        # Tradeoff: This wastes compute by calculating B tokens during A mask. But necessary for constant masks
-        # Masking is coupled here, but correct because ultimately is_mask_B valid check and is_mask_A masking combine to work
         z_m = repeat(z_d[:,self.in_context_len:][is_mask_A], 'Y d -> (O Y) d', O=O)
         feats_p_rb = repeat(x_p_target, 'B N d -> (R B) N d', R=R)
         feats_p_m = repeat(feats_p_rb[is_mask_A], 'Y d -> (O Y) d', O=O, d=feats_p_rb.size(-1))
@@ -939,7 +935,7 @@ class REPR(nn.Module):
         N = self.num_patches
         d = self.hidden_size
 
-        P=self.p_repeat              # P Repeat
+        P=self.p_repeat             # P Repeat
         R=self.batch_repeat         # A Repeat
         R1=self.batch_repeat+1      # A Repeat + 1 (AB and B views concatenated)
         O=self.diff_repeat          # MAR diffloss repeat (From MAR Paper)
@@ -951,6 +947,7 @@ class REPR(nn.Module):
         is_mask_encoder_BABp = rearrange(is_mask_BABp[is_selected_BABp], '(X m) -> X m', X=(1+R+P)*B_IN)
         is_mask_encoder_AB = rearrange(is_mask_AB[is_selected_AB], '(X m) -> X m', X=R*B_IN)
 
+        # Center of Visible Tokens Position Embeddings
         def get_factor_pos(is_mask):
             device = is_mask.device
             B_ = is_mask.size(0)
@@ -962,13 +959,11 @@ class REPR(nn.Module):
             offset_pos_h = rearrange(pos_h, 'b h w -> b (h w)') - mean_pos_h.unsqueeze(-1)
             offset_pos_w = rearrange(pos_w, 'b h w -> b (h w)') - mean_pos_w.unsqueeze(-1)
             offset_idx = (offset_pos_h + self.hw_len - 1 + self.factor_pad) * (2 * self.hw_len - 1 + 2 * self.factor_pad) + (offset_pos_w + self.hw_len - 1 + self.factor_pad)
-            # factor_pos = repeat(self.factor_posembed.to(dtype), 'f d -> b f d', b=B_).gather(1, repeat(offset_idx, 'b n -> b n d', d=self.hidden_size))
             factor_pos = F.embedding(offset_idx, self.factor_posembed.to(dtype))
             
             pad_pos_h = repeat(torch.arange(self.pad_hw, device=device), 'h -> b h w', b=B_, w=self.pad_hw)
             pad_pos_w = repeat(torch.arange(self.pad_hw, device=device), 'w -> b h w', b=B_, h=self.pad_hw)
             pad_offset_idx = (pad_pos_h - mean_pos_h[:,None,None] + self.hw_len - 1) * (self.pad_hw + self.hw_len - 1) + (pad_pos_w - mean_pos_w[:,None,None] + self.hw_len - 1)
-            # factor_pos_pad = repeat(self.factor_posembed.to(dtype), 'f d -> b f d', b=B_).gather(1, repeat(pad_offset_idx, 'b h w -> b (h w) d', d=self.hidden_size))
             factor_pos_pad = F.embedding(rearrange(pad_offset_idx, 'b h w -> b (h w)'), self.factor_posembed.to(dtype))
 
             patch_rope_idx = rearrange((pos_h + self.factor_pad) * self.pad_hw + (pos_w + self.factor_pad), 'b h w -> b (h w)')
@@ -997,7 +992,7 @@ class REPR(nn.Module):
             repeat(z_og_nopos, 'B N d -> (R B) N d', R=R),
         ) + z_AB_factor_pos
                 
-
+        # Encoder
         def get_encoded(z, is_selected, is_mask_encoder):
             B_ = z.size(0)
             z_e = z[is_selected].view(B_, -1, d)  # e: encoder
@@ -1011,6 +1006,7 @@ class REPR(nn.Module):
         z_e_BABp = get_encoded(z_BABp, is_selected_BABp, is_mask_encoder_BABp)
         z_e_AB = get_encoded(z_AB, is_selected_AB, is_mask_encoder_AB)
 
+        # Decoder
         is_mask_BAB = torch.cat([is_mask_B, is_mask_AB], dim=0)
         z_d_B_nomaskpos = z_e_BABp.new_zeros((B_IN,N,d)).masked_scatter(
             repeat(is_selected_B, 'B N -> B N d', d=d),
@@ -1034,8 +1030,8 @@ class REPR(nn.Module):
         for block_idx, block in enumerate(self.decoder):
             z_d = block(z_d, self.feat_rope_incontext, attn_mask=None)
 
-        # Section: Trains such that decoder used to merging multiple encoder inputs.
-        # Tradeoff: This wastes compute by calculating B tokens during A mask. But necessary for constant masks
+        # MAR loss
+        # Tradeoff: This wastes compute by calculating B tokens during A mask. But necessary for constant-size compilable masks
         # Masking is coupled here, but correct because ultimately is_mask_B valid check and is_mask_A masking combine to work
         is_mask_BA = torch.cat([is_mask_B, is_mask_A], dim=0)
         z_m = repeat(z_d[:,self.in_context_len:][is_mask_BA], 'Y d -> (O Y) d', O=O)
@@ -1047,7 +1043,8 @@ class REPR(nn.Module):
         feats_pred = self.diff_mlp(feats_p_m_t, t_m.flatten(), z_m)
         mse_is_valid = repeat(repeat(is_mask_B, 'B N -> (R B) N', R=R1)[is_mask_BA], 'Y -> (O Y) 1', O=O)
         mse_loss = 2*(F.huber_loss(feats_pred*mse_is_valid, feats_p_m*mse_is_valid, reduction='none', delta=10) / (1-t_m).clamp_min(0.33).pow(2)).mean() / mse_is_valid.float().mean()
-        
+
+        # Likelihood Integration
         with torch.no_grad():
             z_decoder_r = rearrange(z_d[:,self.in_context_len:], '(R B) N d -> R B N d', R=R1)
             z_bp_rp = z_decoder_r[:, torch.arange(B_IN, device=device), is_patch_target.int().argmax(-1)].float()
@@ -1103,6 +1100,7 @@ class REPR(nn.Module):
         z_B_repr_global = z_repr_global[:1]
         z_A_repr_global = z_repr_global[1:]
 
+        # PMI Loss
         is_valid_pmi = reduce(~(repeat(~is_valid_target, '(R b) n -> R b P n', R=R1, P=P) & repeat(is_patch_target, 'P b n -> R b P n', R=R1)), 'R b P n -> R b P', 'all')  # don't allow loss for: ~is_mask and is_bp
         is_valid_B = is_valid_pmi[:1]
         is_valid_A = is_valid_pmi[1:]
@@ -1113,9 +1111,9 @@ class REPR(nn.Module):
 
         pmi_pred = torch.einsum('rbqd,bpqd->rbp', z_A_repr[:,:,0], z_Bp_repr - z_B_repr[0]) / (2 * z_A_repr.size(-1) * z_A_repr.size(-2)**0.5) * d**0.5  # GIGA TODO USE REPR HERE!
         pmi_pred_global = torch.einsum('rbd,bpd->rbp', z_A_repr_global[:,:,0], z_Bp_repr_global - z_B_repr_global[0]) / (2 * z_A_repr_global.size(-1)**0.5)
-        pmi_target = (h_p_given_B_preintegration - h_p_given_BA_preintegration).mean(-1)  # GIGA TODO THIS CLAMPING IS ONLY GOOD FOR PIXELS (BUT SANCHECKED)
+        pmi_target = (h_p_given_B_preintegration - h_p_given_BA_preintegration).mean(-1)
 
-        # Factorization has an optimum at zero, so huber should be fine, no? Only kind of due to E[PMI est error], but PMI est bias dominates regardless
+        # Using Huber for MSE Gradient Clipping
         repr_loss = (2*F.huber_loss(pmi_pred, pmi_target, reduction='none', delta=self.repr_delta) * is_valid / reduce(is_valid.bfloat16(), 'R b P -> R b 1', 'mean').clamp_min(1e-5)).mean()
         repr_loss_global = (2*F.huber_loss(pmi_pred_global, pmi_target, reduction='none', delta=self.repr_delta) * is_valid / reduce(is_valid.bfloat16(), 'R b P -> R b 1', 'mean').clamp_min(1e-5)).mean()
 
@@ -1137,7 +1135,6 @@ class REPR(nn.Module):
         d = self.hidden_size
         R=1
 
-        # Preserve the zero-mask path's random-number order during training.
         mask_rank = torch.rand((B_IN, N), device=device).argsort(dim=1).argsort(dim=1)
         is_mask_rb = mask_rank < num_mask_tokens
         is_selected_rb = ~is_mask_rb
