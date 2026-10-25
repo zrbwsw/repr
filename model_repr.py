@@ -1095,7 +1095,6 @@ class REPR(nn.Module):
 
         z_BA_repr = torch.where(torch.rand(z_BA_repr.size(0),device=device).view(-1,1,1,1,1) < self.pad_dropout, z_BA_repr*self.pad_dropout_mask.to(dtype), z_BA_repr)
 
-        # MINI TODO REMOVE IS EMPTY
         is_empty_BA = is_mask_BA.all(-1)
         z_BA_repr = torch.where(is_empty_BA.view(R1, B_IN, 1, 1, 1), 0, z_BA_repr)
         z_repr_global = torch.where(is_empty_BA.view(R1, B_IN, 1, 1), 0, z_repr_global)

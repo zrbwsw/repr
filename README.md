@@ -6,9 +6,7 @@
 
 ## Codebase Setup
 
-This codebase is a fork of  [JiT](https://github.com/LTH14/JiT/)
-
-Setup and installation follow
+This codebase is a fork of  [JiT](https://github.com/LTH14/JiT/), which includes installation instructions.
 
 The code mainly uses four files
 * main_jit: Model parameter setup
@@ -16,7 +14,7 @@ The code mainly uses four files
 * denoiser_repr: Model setup and method calling
 * model_repr: RePR model
   * forward_mar: 3 out of 4 training steps only perform MAR training
-  * forward_repr: 1 out of 4 trainint steps optimize RePR and MAR. The RePR code has 5 unique input masks, and batch repeating, so it is dense, but I 
+  * forward_repr: 1 out of 4 trainint steps optimize RePR and MAR. The RePR code has 5 unique input masks, and two axes for repeating. It is dense but readable.
 
 ## Model Training
 
