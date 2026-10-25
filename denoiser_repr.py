@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model_repr_mar_2 import REPR_MODELS
+from model_repr import REPR_MODELS
 
 
 class ReprDenoiser(nn.Module):
@@ -15,10 +15,10 @@ class ReprDenoiser(nn.Module):
             diff_mlp_depth=args.diff_mlp_depth,
             batch_repeat=args.batch_repeat * args.global_batch_repeat,
             diff_repeat=args.diff_repeat,
-            b_num_p=args.b_num_p,
+            p_repeat=args.p_repeat,
             diff_repeat_repr=args.diff_repeat_repr,
-            b_max=args.b_max,
-            mask_m=args.mask_m,
+            b_max_visible=args.b_max_visible,
+            a_min_mask=args.a_min_mask,
             mask_strategy_mar=args.mask_strategy_mar,
             mask_strategy_repr=args.mask_strategy_repr,
             repr_loss_weight=args.repr_loss_weight,
@@ -41,10 +41,10 @@ class ReprDenoiser(nn.Module):
                 diff_mlp_depth=args.diff_mlp_depth,
                 batch_repeat=args.batch_repeat,
                 diff_repeat=args.diff_repeat,
-                b_num_p=args.b_num_p,
+                p_repeat=args.p_repeat,
                 diff_repeat_repr=args.diff_repeat_repr,
-                b_max=args.b_max,
-                mask_m=args.mask_m,
+                b_max_visible=args.b_max_visible,
+                a_min_mask=args.a_min_mask,
                 mask_strategy_mar=args.mask_strategy_mar,
                 mask_strategy_repr=args.mask_strategy_repr,
                 repr_loss_weight=args.repr_loss_weight,

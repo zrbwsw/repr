@@ -19,7 +19,7 @@ import util.misc as misc
 
 from engine_jit import train_one_epoch
 
-from denoiser_mar import ReprDenoiser
+from denoiser_repr import ReprDenoiser
 
 
 def get_args_parser():
@@ -80,10 +80,9 @@ def get_args_parser():
                         help='URL used to set up distributed training')
 
     # REPR training
-    parser.add_argument('--denoiser', default='denoiser_mar', choices=['denoiser_mar'])
+    parser.add_argument('--denoiser', default='denoiser_repr', choices=['denoiser_repr'])
     parser.add_argument('--denoiser_mode', default='repr_mar',
                         choices=['mar', 'repr_mar', 'repr_mar_featspred', 'get_stats'])
-    parser.add_argument('--repr_version', '--version', default='22', choices=['22'])
     parser.add_argument('--decay_epochs', type=int, default=0, metavar='N',
                         help='Epochs to linearly decay LR at the end of training')
     parser.add_argument('--train_aug', action='store_true',
@@ -107,10 +106,10 @@ def get_args_parser():
     parser.add_argument('--batch_repeat_mar', type=int, default=1)
     parser.add_argument('--global_batch_repeat', type=int, default=1)
     parser.add_argument('--diff_repeat', type=int, default=4)
-    parser.add_argument('--b_num_p', '--d_num_p', type=int, default=8)
+    parser.add_argument('--p_repeat', type=int, default=8)
     parser.add_argument('--diff_repeat_repr', type=int, default=32)
-    parser.add_argument('--b_max', '--d_max', type=int, default=48)
-    parser.add_argument('--mask_m', type=int, default=256 - 76)
+    parser.add_argument('--b_max_visible', type=int, default=48)
+    parser.add_argument('--a_min_mask', type=int, default=256 - 76)
     parser.add_argument('--mask_strategy_mar', choices=['random', 'block'], default='block')
     parser.add_argument('--mask_strategy_repr', choices=['random', 'block'], default='block')
     parser.add_argument('--repr_loss_weight', type=float, default=0.1)
