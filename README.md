@@ -4,6 +4,12 @@
 [![arXiv](https://img.shields.io/badge/arXiv%20paper-2610.20533-b31b1b.svg)](https://arxiv.org/abs/2610.20533)&nbsp;
 [![Blog](https://img.shields.io/badge/Blog-Read-3366cc.svg)](https://alanbaade.github.io/repr/)&nbsp;
 
+## 中文注释与解读
+
+本分支为全部 12 个 Python 文件补充了中文阅读注释。Figure 1 的共享 encoder、MAE 条件分支、PMI 估计、表征头和训练流程详见 **[中文解读与代码阅读指南](README_zh.md)**。
+
+---
+
 ## Codebase Setup
 
 This codebase is a fork of  [JiT](https://github.com/LTH14/JiT/), which includes installation instructions.
